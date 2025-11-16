@@ -333,30 +333,82 @@ class CustomAPIEvaluator:
         """
         LOGGER.info(f"Loading {split} dataset from FiNER-139...")
 
-        # 尝试直接从 parquet 文件加载（新版本 datasets 库的要求）
+        # 尝试多种方式加载数据集
+        dataset = None
+
+        # 方法1: 尝试直接从 HuggingFace Hub 加载（使用 revision 参数）
         try:
-            # 使用 data_files 参数直接加载 parquet 文件
-            parquet_urls = {
-                "train": "https://huggingface.co/datasets/nlpaueb/finer-139/resolve/main/data/train-00000-of-00001.parquet",
-                "validation": "https://huggingface.co/datasets/nlpaueb/finer-139/resolve/main/data/validation-00000-of-00001.parquet",
-                "test": "https://huggingface.co/datasets/nlpaueb/finer-139/resolve/main/data/test-00000-of-00001.parquet",
-            }
-
-            if split not in parquet_urls:
-                raise ValueError(
-                    f"Invalid split: {split}. Must be one of: train, validation, test"
-                )
-
+            LOGGER.info(f"Attempting to load from HuggingFace Hub...")
             dataset = datasets.load_dataset(
-                "parquet", data_files=parquet_urls[split], split="train"
+                "nlpaueb/finer-139",
+                split=split,
+                revision="refs/convert/parquet",  # 使用 parquet 转换分支
             )
-
-        except Exception as e:
-            LOGGER.error(f"Failed to load dataset: {e}")
             LOGGER.info(
-                "Please make sure you have internet connection to download the dataset."
+                f"Successfully loaded {len(dataset)} samples from HuggingFace Hub"
             )
-            raise
+        except Exception as e1:
+            LOGGER.warning(f"Method 1 failed: {e1}")
+
+            # 方法2: 尝试使用 data_files 直接加载 parquet
+            try:
+                LOGGER.info(f"Attempting to load from parquet files...")
+                # 检查 HuggingFace 上实际的文件路径
+                parquet_urls = {
+                    "train": "hf://datasets/nlpaueb/finer-139/train-00000-of-00001.parquet",
+                    "validation": "hf://datasets/nlpaueb/finer-139/validation-00000-of-00001.parquet",
+                    "test": "hf://datasets/nlpaueb/finer-139/test-00000-of-00001.parquet",
+                }
+
+                if split not in parquet_urls:
+                    raise ValueError(
+                        f"Invalid split: {split}. Must be one of: train, validation, test"
+                    )
+
+                dataset = datasets.load_dataset(
+                    "parquet", data_files=parquet_urls[split], split="train"
+                )
+                LOGGER.info(f"Successfully loaded {len(dataset)} samples from parquet")
+            except Exception as e2:
+                LOGGER.warning(f"Method 2 failed: {e2}")
+
+                # 方法3: 下载并缓存 parquet 文件
+                try:
+                    LOGGER.info(f"Attempting to download parquet file...")
+                    from huggingface_hub import hf_hub_download
+
+                    file_map = {
+                        "train": "train-00000-of-00001.parquet",
+                        "validation": "validation-00000-of-00001.parquet",
+                        "test": "test-00000-of-00001.parquet",
+                    }
+
+                    local_file = hf_hub_download(
+                        repo_id="nlpaueb/finer-139",
+                        filename=file_map[split],
+                        repo_type="dataset",
+                    )
+
+                    dataset = datasets.load_dataset(
+                        "parquet", data_files=local_file, split="train"
+                    )
+                    LOGGER.info(
+                        f"Successfully loaded {len(dataset)} samples from downloaded file"
+                    )
+                except Exception as e3:
+                    LOGGER.error(f"All methods failed to load dataset.")
+                    LOGGER.error(f"Method 1 error: {e1}")
+                    LOGGER.error(f"Method 2 error: {e2}")
+                    LOGGER.error(f"Method 3 error: {e3}")
+                    LOGGER.info(
+                        "\nPlease try one of the following:\n"
+                        "1. Check your internet connection\n"
+                        "2. Manually download the dataset from https://huggingface.co/datasets/nlpaueb/finer-139\n"
+                        "3. Use the original finer.py with an older version of datasets library\n"
+                    )
+                    raise RuntimeError(
+                        "Failed to load dataset after trying all methods"
+                    )
 
         if max_samples:
             dataset = dataset.select(range(min(max_samples, len(dataset))))
