@@ -1,14 +1,24 @@
-click
-datasets==2.1.0
-gensim==4.2.0
-regex
-scikit-learn>=1.0.2
-seqeval==1.2.2
-tensorflow==2.8.0
-tensorflow-addons==1.16.1
-tf2crf==0.1.24
-tokenizers==0.12.1
-tqdm
-transformers==4.18.0
-wandb==0.12.16
-wget
+# API 评估所需的最小依赖（兼容 Python 3.10+）
+# 用于 evaluate_custom_api.py
+
+# 数据集加载
+datasets>=2.14.0
+huggingface-hub>=0.16.0
+
+# 评估指标
+seqeval>=1.2.2
+
+# API 调用
+requests>=2.31.0
+python-dotenv>=1.0.0
+openai>=1.0.0
+
+# 基础依赖
+numpy>=1.24.0
+pandas>=2.0.0
+tqdm>=4.65.0
+
+# 可选：如果需要本地模型预测
+# transformers>=4.30.0
+# torch>=2.0.0
+

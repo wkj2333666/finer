@@ -1,11 +1,19 @@
+#!/usr/bin/env python3
 """
-评估自定义 API 在 FiNER-139 数据集上的性能
+可扩展的 LLM 评估脚本 - FiNER-139 Benchmark
+
+核心设计：
+- call_api() 函数是开放接口，可以重写来适配不同的 LLM
+- 支持自定义 prompt 和输出解析逻辑
+- 提供完整的评估流程
 
 使用方法:
-    python evaluate_custom_api.py --api_endpoint "http://your-api-url" --split "test"
+1. 继承 FiNERLLMEvaluator 类并重写 call_api 方法
+2. 或者直接修改 call_api 方法来适配你的 LLM API
 
-或者使用本地函数:
-    python evaluate_custom_api.py --use_local_function --split "test"
+运行:
+    python evaluate_llm.py --max_samples 10  # 快速测试
+    python evaluate_llm.py --split test       # 完整评估
 """
 
 import argparse
@@ -13,11 +21,17 @@ import datasets
 import itertools
 import json
 import logging
-import requests
+import os
+import re
 from typing import List, Dict, Tuple
 from tqdm import tqdm
 from seqeval.metrics import classification_report
 from seqeval.scheme import IOB2
+from dotenv import load_dotenv
+from openai import OpenAI
+from baseline_prompt import baseline_prompt
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
@@ -25,25 +39,29 @@ logging.basicConfig(
 LOGGER = logging.getLogger(__name__)
 
 
-class CustomAPIEvaluator:
-    """用于评估自定义 API 在 FiNER-139 benchmark 上的表现"""
+class FiNERLLMEvaluator:
+    """
+    FiNER-139 LLM 评估器
 
-    def __init__(self, api_endpoint: str = None, api_key: str = None):
-        """
-        初始化评估器
+    核心方法：
+    - call_api(): 需要重写的接口，用于调用你的 LLM
+    - evaluate(): 在数据集上运行完整评估
+    """
 
-        Args:
-            api_endpoint: API 端点 URL
-            api_key: API 密钥（如果需要）
-        """
-        self.api_endpoint = api_endpoint
-        self.api_key = api_key
+    def __init__(
+        self, endpoint: str = None, api_key: str = None, model_name: str = None
+    ):
+        """初始化评估器"""
         self.tag2idx, self.idx2tag = self.load_dataset_tags()
+        self.endpoint = endpoint
+        self.api_key = api_key
+        self.model_name = model_name
+        self.client = OpenAI(api_key=self.api_key, base_url=self.endpoint)
 
     @staticmethod
     def load_dataset_tags() -> Tuple[Dict, Dict]:
-        """加载数据集标签 - 使用硬编码的标签列表（FiNER-139 的固定标签）"""
-        # 由于新版本 datasets 库不支持脚本数据集，直接使用硬编码的标签列表
+        """加载数据集标签"""
+        # FiNER-139 的固定标签列表
         dataset_tags = [
             "O",
             "B-AccountsPayableCurrent",
@@ -230,212 +248,125 @@ class CustomAPIEvaluator:
         idx2tag = {idx: tag for tag, idx in tag2idx.items()}
         return tag2idx, idx2tag
 
+    # ==========================================================================
+    # 核心接口：重写这个函数来适配你的 LLM
+    # ==========================================================================
+
     def call_api(self, tokens: List[str]) -> List[str]:
         """
-        调用 API 获取预测结果
+        【重要】这是需要你重写的核心函数！
+
+        功能：调用你的 LLM API，对输入的 tokens 进行 NER 标注
 
         Args:
-            tokens: 输入的 token 列表
+            tokens: 输入的 token 列表，例如:
+                   ["The", "company", "reported", "revenue", "of", "$", "1.2", "million"]
 
         Returns:
-            预测的标签列表
+            labels: 预测的标签列表，例如:
+                   ["O", "O", "O", "B-Revenues", "O", "O", "I-Revenues", "I-Revenues"]
 
-        API 输入格式示例:
-        {
-            "tokens": ["The", "company", "reported", "revenue", "of", "$", "1.2", "million"]
-        }
+        注意：
+        1. 返回的标签数量必须与输入 tokens 数量相同
+        2. 标签格式必须是 IOB2 (B-EntityType, I-EntityType, O)
+        3. 如果出错，返回全 "O" 标签
 
-        API 输出格式示例:
-        {
-            "labels": ["O", "O", "O", "B-Revenues", "O", "O", "I-Revenues", "I-Revenues"]
-        }
+        示例实现见下方的 call_api_example_*() 函数
         """
-        if self.api_endpoint is None:
-            raise ValueError("API endpoint not provided")
+        # 将 tokens 转换为 JSON 字符串格式
+        user_content = json.dumps(tokens)
 
-        headers = {"Content-Type": "application/json"}
-
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        payload = {"tokens": tokens}
-
-        try:
-            response = requests.post(
-                self.api_endpoint, json=payload, headers=headers, timeout=30
+        response = (
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[
+                    {"role": "system", "content": baseline_prompt},
+                    {"role": "user", "content": user_content},
+                ],
+                temperature=0,
+                # max_tokens=2000,
             )
-            response.raise_for_status()
-            result = response.json()
-
-            # 根据你的 API 实际返回格式调整这里
-            if "labels" in result:
-                return result["labels"]
-            elif "predictions" in result:
-                return result["predictions"]
-            else:
-                raise ValueError(f"Unexpected API response format: {result}")
-
-        except requests.exceptions.RequestException as e:
-            LOGGER.error(f"API request failed: {e}")
-            # 返回全 O 标签作为后备
-            return ["O"] * len(tokens)
-
-    def predict_local(self, tokens: List[str]) -> List[str]:
-        """
-        使用本地函数进行预测（用于测试或本地模型）
-
-        你需要根据自己的模型修改这个函数
-
-        Args:
-            tokens: 输入的 token 列表
-
-        Returns:
-            预测的标签列表
-        """
-        # 示例：这里是一个简单的规则基线
-        # 你应该替换成你自己的模型预测逻辑
-
-        # 方法1: 如果你有本地的模型文件
-        # from transformers import AutoModelForTokenClassification, AutoTokenizer
-        # model = AutoModelForTokenClassification.from_pretrained("your_model_path")
-        # tokenizer = AutoTokenizer.from_pretrained("your_model_path")
-        # ...进行预测...
-
-        # 方法2: 如果你想加载训练好的模型
-        # import tensorflow as tf
-        # model = tf.keras.models.load_model("your_model_path")
-        # ...进行预测...
-
-        # 临时示例代码（返回全 O）
-        LOGGER.warning(
-            "Using default prediction (all 'O' labels). Please implement your own prediction logic."
+            .choices[0]
+            .message.content
         )
-        return ["O"] * len(tokens)
+        LOGGER.info(response)
+        return json.loads(response)
+
+    # ==========================================================================
+    # 评估流程
+    # ==========================================================================
 
     def evaluate(
         self,
         split: str = "test",
         max_samples: int = None,
-        use_local: bool = False,
-        batch_size: int = 1,
+        save_predictions: bool = False,
     ) -> Dict:
         """
-        在指定的数据集分割上评估 API 性能
+        在数据集上运行评估
 
         Args:
             split: 数据集分割 ("train", "validation", "test")
             max_samples: 最大样本数（用于快速测试）
-            use_local: 是否使用本地预测函数
-            batch_size: 批处理大小（如果你的 API 支持批处理）
+            save_predictions: 是否保存详细预测结果
 
         Returns:
             评估结果字典
         """
-        LOGGER.info(f"Loading {split} dataset from FiNER-139...")
+        LOGGER.info(f"加载 {split} 数据集...")
 
-        # 尝试多种方式加载数据集
-        dataset = None
-
-        # 方法1: 尝试直接从 HuggingFace Hub 加载（使用 revision 参数）
+        # 加载数据集
         try:
-            LOGGER.info(f"Attempting to load from HuggingFace Hub...")
             dataset = datasets.load_dataset(
-                "nlpaueb/finer-139",
-                split=split,
-                revision="refs/convert/parquet",  # 使用 parquet 转换分支
+                "nlpaueb/finer-139", split=split, revision="refs/convert/parquet"
             )
-            LOGGER.info(
-                f"Successfully loaded {len(dataset)} samples from HuggingFace Hub"
-            )
+            LOGGER.info(f"成功从 HuggingFace Hub 加载数据集")
         except Exception as e1:
-            LOGGER.warning(f"Method 1 failed: {e1}")
-
-            # 方法2: 尝试使用 data_files 直接加载 parquet
+            LOGGER.warning(f"从 Hub 加载失败: {e1}")
             try:
-                LOGGER.info(f"Attempting to load from parquet files...")
-                # 检查 HuggingFace 上实际的文件路径
-                parquet_urls = {
-                    "train": "hf://datasets/nlpaueb/finer-139/train-00000-of-00001.parquet",
-                    "validation": "hf://datasets/nlpaueb/finer-139/validation-00000-of-00001.parquet",
-                    "test": "hf://datasets/nlpaueb/finer-139/test-00000-of-00001.parquet",
+                from huggingface_hub import hf_hub_download
+
+                file_map = {
+                    "train": "train-00000-of-00001.parquet",
+                    "validation": "validation-00000-of-00001.parquet",
+                    "test": "test-00000-of-00001.parquet",
                 }
-
-                if split not in parquet_urls:
-                    raise ValueError(
-                        f"Invalid split: {split}. Must be one of: train, validation, test"
-                    )
-
-                dataset = datasets.load_dataset(
-                    "parquet", data_files=parquet_urls[split], split="train"
+                local_file = hf_hub_download(
+                    repo_id="nlpaueb/finer-139",
+                    filename=file_map[split],
+                    repo_type="dataset",
                 )
-                LOGGER.info(f"Successfully loaded {len(dataset)} samples from parquet")
+                dataset = datasets.load_dataset(
+                    "parquet", data_files=local_file, split="train"
+                )
+                LOGGER.info(f"成功从 parquet 文件加载数据集")
             except Exception as e2:
-                LOGGER.warning(f"Method 2 failed: {e2}")
-
-                # 方法3: 下载并缓存 parquet 文件
-                try:
-                    LOGGER.info(f"Attempting to download parquet file...")
-                    from huggingface_hub import hf_hub_download
-
-                    file_map = {
-                        "train": "train-00000-of-00001.parquet",
-                        "validation": "validation-00000-of-00001.parquet",
-                        "test": "test-00000-of-00001.parquet",
-                    }
-
-                    local_file = hf_hub_download(
-                        repo_id="nlpaueb/finer-139",
-                        filename=file_map[split],
-                        repo_type="dataset",
-                    )
-
-                    dataset = datasets.load_dataset(
-                        "parquet", data_files=local_file, split="train"
-                    )
-                    LOGGER.info(
-                        f"Successfully loaded {len(dataset)} samples from downloaded file"
-                    )
-                except Exception as e3:
-                    LOGGER.error(f"All methods failed to load dataset.")
-                    LOGGER.error(f"Method 1 error: {e1}")
-                    LOGGER.error(f"Method 2 error: {e2}")
-                    LOGGER.error(f"Method 3 error: {e3}")
-                    LOGGER.info(
-                        "\nPlease try one of the following:\n"
-                        "1. Check your internet connection\n"
-                        "2. Manually download the dataset from https://huggingface.co/datasets/nlpaueb/finer-139\n"
-                        "3. Use the original finer.py with an older version of datasets library\n"
-                    )
-                    raise RuntimeError(
-                        "Failed to load dataset after trying all methods"
-                    )
+                LOGGER.error(f"加载数据集失败: {e2}")
+                raise
 
         if max_samples:
             dataset = dataset.select(range(min(max_samples, len(dataset))))
 
-        LOGGER.info(f"Evaluating on {len(dataset)} samples...")
+        LOGGER.info(f"开始评估 {len(dataset)} 个样本...")
 
         y_true_all = []
         y_pred_all = []
+        predictions = [] if save_predictions else None
 
-        for idx, sample in enumerate(tqdm(dataset, desc="Processing samples")):
+        for idx, sample in enumerate(tqdm(dataset, desc="评估中")):
             tokens = sample["tokens"]
             true_labels_idx = sample["ner_tags"]
 
-            # 将索引转换为标签字符串
+            # 转换为标签字符串
             true_labels = [self.idx2tag[label_idx] for label_idx in true_labels_idx]
 
-            # 调用 API 或本地函数获取预测
-            if use_local:
-                pred_labels = self.predict_local(tokens)
-            else:
-                pred_labels = self.call_api(tokens)
+            # 调用 LLM API 获取预测
+            pred_labels = self.call_api(tokens)
 
-            # 确保预测标签数量与真实标签数量一致
+            # 确保长度匹配
             if len(pred_labels) != len(true_labels):
                 LOGGER.warning(
-                    f"Sample {idx}: Prediction length ({len(pred_labels)}) "
-                    f"doesn't match true labels ({len(true_labels)}). Padding/truncating."
+                    f"样本 {idx}: 预测长度 ({len(pred_labels)}) != 真实长度 ({len(true_labels)})"
                 )
                 if len(pred_labels) < len(true_labels):
                     pred_labels.extend(["O"] * (len(true_labels) - len(pred_labels)))
@@ -445,12 +376,21 @@ class CustomAPIEvaluator:
             y_true_all.append(true_labels)
             y_pred_all.append(pred_labels)
 
+            if save_predictions:
+                predictions.append(
+                    {
+                        "id": sample.get("id", idx),
+                        "tokens": tokens,
+                        "true_labels": true_labels,
+                        "pred_labels": pred_labels,
+                    }
+                )
+
         # 计算评估指标
         LOGGER.info("\n" + "=" * 80)
-        LOGGER.info(f"Evaluation Results on {split.upper()} Split")
+        LOGGER.info(f"{split.upper()} 数据集评估结果")
         LOGGER.info("=" * 80 + "\n")
 
-        # 使用 seqeval 计算详细的分类报告
         report = classification_report(
             y_true=y_true_all,
             y_pred=y_pred_all,
@@ -462,130 +402,60 @@ class CustomAPIEvaluator:
 
         LOGGER.info(report)
 
-        # 保存结果
         results = {"split": split, "num_samples": len(dataset), "report": report}
+
+        if save_predictions:
+            results["predictions"] = predictions
 
         return results
 
-    def evaluate_sample(
-        self, tokens: List[str], true_labels: List[str] = None, use_local: bool = False
-    ) -> Dict:
-        """
-        评估单个样本（用于调试）
-
-        Args:
-            tokens: token 列表
-            true_labels: 真实标签列表（如果有）
-            use_local: 是否使用本地预测
-
-        Returns:
-            包含预测结果的字典
-        """
-        if use_local:
-            pred_labels = self.predict_local(tokens)
-        else:
-            pred_labels = self.call_api(tokens)
-
-        result = {"tokens": tokens, "predictions": pred_labels}
-
-        if true_labels:
-            result["true_labels"] = true_labels
-            # 计算单个样本的准确率
-            correct = sum(1 for p, t in zip(pred_labels, true_labels) if p == t)
-            result["token_accuracy"] = correct / len(tokens)
-
-        return result
-
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="评估自定义 API 在 FiNER-139 benchmark 上的性能"
-    )
-    parser.add_argument(
-        "--api_endpoint",
-        type=str,
-        default=None,
-        help="API 端点 URL (例如: http://localhost:8000/predict)",
-    )
-    parser.add_argument(
-        "--api_key", type=str, default=None, help="API 密钥（如果需要认证）"
-    )
+    parser = argparse.ArgumentParser(description="使用 LLM 评估 FiNER-139 benchmark")
     parser.add_argument(
         "--split",
         type=str,
         default="test",
         choices=["train", "validation", "test"],
-        help="要评估的数据集分割",
+        help="数据集分割",
     )
     parser.add_argument(
         "--max_samples", type=int, default=None, help="最大评估样本数（用于快速测试）"
     )
     parser.add_argument(
-        "--use_local_function", action="store_true", help="使用本地预测函数而不是 API"
+        "--output", type=str, default="llm_evaluation_results.json", help="输出文件路径"
     )
     parser.add_argument(
-        "--demo", action="store_true", help="运行演示模式（评估单个样本）"
-    )
-    parser.add_argument(
-        "--output", type=str, default="evaluation_results.json", help="输出结果文件路径"
+        "--save_predictions", action="store_true", help="保存详细的预测结果"
     )
 
     args = parser.parse_args()
 
-    # 初始化评估器
-    evaluator = CustomAPIEvaluator(api_endpoint=args.api_endpoint, api_key=args.api_key)
+    # 创建评估器
+    evaluator = FiNERLLMEvaluator(
+        endpoint=os.getenv("ENDPOINT"),
+        api_key=os.getenv("API_KEY"),
+        model_name=os.getenv("MODEL_NAME"),
+    )
 
-    if args.demo:
-        # 演示模式：评估单个示例
-        LOGGER.info("Running in demo mode...")
-        demo_tokens = [
-            "The",
-            "company",
-            "reported",
-            "revenue",
-            "of",
-            "$",
-            "1.2",
-            "million",
-        ]
-        demo_labels = [
-            "O",
-            "O",
-            "O",
-            "B-Revenues",
-            "O",
-            "O",
-            "I-Revenues",
-            "I-Revenues",
-        ]
+    # 提示用户重写 call_api
+    LOGGER.info("=" * 80)
+    LOGGER.info("注意：请确保已经重写了 call_api() 方法来调用你的 LLM！")
+    LOGGER.info("参考 call_api_example_*() 方法了解如何实现")
+    LOGGER.info("=" * 80 + "\n")
 
-        result = evaluator.evaluate_sample(
-            tokens=demo_tokens,
-            true_labels=demo_labels,
-            use_local=args.use_local_function,
-        )
+    # 运行评估
+    results = evaluator.evaluate(
+        split=args.split,
+        max_samples=args.max_samples,
+        save_predictions=args.save_predictions,
+    )
 
-        LOGGER.info("\n" + "=" * 80)
-        LOGGER.info("Demo Sample Evaluation")
-        LOGGER.info("=" * 80)
-        LOGGER.info(f"\nTokens: {result['tokens']}")
-        LOGGER.info(f"True Labels: {result['true_labels']}")
-        LOGGER.info(f"Predictions: {result['predictions']}")
-        LOGGER.info(f"Token Accuracy: {result['token_accuracy']:.4f}")
+    # 保存结果
+    with open(args.output, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
 
-    else:
-        # 完整评估模式
-        results = evaluator.evaluate(
-            split=args.split,
-            max_samples=args.max_samples,
-            use_local=args.use_local_function,
-        )
-
-        # 保存结果
-        with open(args.output, "w", encoding="utf-8") as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-
-        LOGGER.info(f"\nResults saved to: {args.output}")
+    LOGGER.info(f"\n结果已保存到: {args.output}")
 
 
 if __name__ == "__main__":
